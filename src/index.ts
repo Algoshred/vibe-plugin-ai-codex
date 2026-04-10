@@ -2,12 +2,48 @@
  * vibe-plugin-codex
  *
  * OpenAI Codex AI agent provider for VibeControls Agent.
- * Implements the AIAgentProvider interface to manage Codex sessions.
- * Uses the `codex` CLI with `--quiet` and `-a full-auto` flags.
+ * Implements the AIAgentProvider interface with dual-mode support:
+ * - SDK mode: Uses the openai SDK for direct API access
+ * - CLI mode: Uses the `codex` CLI with `--quiet -a full-auto` flags
+ *
+ * Mode auto-detection: SDK if OPENAI_API_KEY is set, CLI if `codex`
+ * binary is found, error if neither is available.
  */
 
 // ── Locally Redeclared Interfaces ────────────────────────────────────────
 // (Avoid hard dependency on @vibecontrols/agent)
+
+type ProviderMode = "sdk" | "cli";
+
+interface AIModelInfo {
+  id: string;
+  name: string;
+  provider: string;
+  contextWindow: number;
+  maxOutputTokens: number;
+  supportsVision: boolean;
+  supportsStreaming: boolean;
+  inputPricePerMToken: number;
+  outputPricePerMToken: number;
+}
+
+interface AIProviderCapabilities {
+  streaming: boolean;
+  vision: boolean;
+  fileAttachments: boolean;
+  toolUse: boolean;
+  mcpSupport: boolean;
+  voiceMode: boolean;
+  cancelSupport: boolean;
+  modelListing: boolean;
+}
+
+interface AIFileAttachment {
+  filename: string;
+  mimeType: string;
+  content: Buffer | string;
+  size: number;
+}
 
 interface VibePlugin {
   name: string;
@@ -159,8 +195,15 @@ interface AIAgentProvider {
   listSessions(): Promise<AISession[]>;
   getSessionStatus(sessionId: string): Promise<AISessionStatus>;
   healthCheck(): Promise<{ ok: boolean; message?: string }>;
+  listModels?(): Promise<AIModelInfo[]>;
+  cancelRequest?(sessionId: string): Promise<void>;
+  getCapabilities?(): AIProviderCapabilities;
+  attachFiles?(sessionId: string, files: AIFileAttachment[]): Promise<void>;
+  getMode?(): ProviderMode;
+  setMode?(mode: ProviderMode): void;
 }
 
+// Log ingester interface (from ai plugin's service registry)
 interface LogIngester {
   append(input: {
     sessionId: string;
@@ -173,17 +216,423 @@ interface LogIngester {
   }): unknown;
 }
 
-// ── Provider Implementation ──────────────────────────────────────────────
+// ── Provider Adapter Interface ──────────────────────────────────────────
+
+interface ProviderAdapter {
+  readonly mode: ProviderMode;
+
+  sendPrompt(
+    prompt: string,
+    config: AISessionConfig,
+    signal?: AbortSignal,
+  ): Promise<{
+    content: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    durationMs: number;
+    metadata?: Record<string, unknown>;
+  }>;
+
+  streamPrompt(
+    prompt: string,
+    config: AISessionConfig,
+    onChunk: (chunk: AIStreamChunk) => void,
+    signal?: AbortSignal,
+  ): Promise<{
+    content: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    durationMs: number;
+    metadata?: Record<string, unknown>;
+  }>;
+
+  healthCheck(): Promise<{ ok: boolean; message?: string }>;
+}
+
+// ── Constants ───────────────────────────────────────────────────────────
 
 const PROVIDER_NAME = "codex";
 const CLI_COMMAND = "codex";
 const DISPLAY_NAME = "OpenAI Codex";
+const DEFAULT_MODEL = "gpt-4.1-mini";
+const DEFAULT_MAX_TOKENS = 16_384;
+
+const CODEX_MODELS: AIModelInfo[] = [
+  {
+    id: "codex-mini-latest",
+    name: "Codex Mini",
+    provider: PROVIDER_NAME,
+    contextWindow: 200_000,
+    maxOutputTokens: 100_000,
+    supportsVision: false,
+    supportsStreaming: true,
+    inputPricePerMToken: 1.5,
+    outputPricePerMToken: 6.0,
+  },
+  {
+    id: "gpt-4.1",
+    name: "GPT-4.1",
+    provider: PROVIDER_NAME,
+    contextWindow: 1_047_576,
+    maxOutputTokens: 32_768,
+    supportsVision: true,
+    supportsStreaming: true,
+    inputPricePerMToken: 2.0,
+    outputPricePerMToken: 8.0,
+  },
+  {
+    id: "gpt-4.1-mini",
+    name: "GPT-4.1 Mini",
+    provider: PROVIDER_NAME,
+    contextWindow: 1_047_576,
+    maxOutputTokens: 32_768,
+    supportsVision: true,
+    supportsStreaming: true,
+    inputPricePerMToken: 0.4,
+    outputPricePerMToken: 1.6,
+  },
+  {
+    id: "gpt-4.1-nano",
+    name: "GPT-4.1 Nano",
+    provider: PROVIDER_NAME,
+    contextWindow: 1_047_576,
+    maxOutputTokens: 32_768,
+    supportsVision: true,
+    supportsStreaming: true,
+    inputPricePerMToken: 0.1,
+    outputPricePerMToken: 0.4,
+  },
+  {
+    id: "o4-mini",
+    name: "o4-mini",
+    provider: PROVIDER_NAME,
+    contextWindow: 200_000,
+    maxOutputTokens: 100_000,
+    supportsVision: true,
+    supportsStreaming: true,
+    inputPricePerMToken: 1.1,
+    outputPricePerMToken: 4.4,
+  },
+];
+
+// ── SDK Adapter ─────────────────────────────────────────────────────────
+
+/** OpenAI SDK type aliases to avoid importing at module level */
+interface OpenAIClient {
+  responses: {
+    create(
+      params: Record<string, unknown>,
+    ): Promise<OpenAIResponse> & AsyncIterable<OpenAIStreamEvent>;
+  };
+}
+
+interface OpenAIResponse {
+  id: string;
+  output: Array<{ type: string; content?: Array<{ type: string; text?: string }> }>;
+  model: string;
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+  };
+}
+
+interface OpenAIStreamEvent {
+  type: string;
+  delta?: string;
+}
+
+class CodexSdkAdapter implements ProviderAdapter {
+  readonly mode: ProviderMode = "sdk";
+  private client: OpenAIClient | null = null;
+
+  private async getClient(): Promise<OpenAIClient> {
+    if (this.client) return this.client;
+
+    try {
+      const mod = await import("openai");
+      const OpenAI = mod.default ?? mod;
+      this.client = new OpenAI({
+        apiKey: process.env["OPENAI_API_KEY"],
+      }) as unknown as OpenAIClient;
+      return this.client;
+    } catch {
+      throw new Error(
+        "Failed to load openai SDK. Install it with: bun add openai",
+      );
+    }
+  }
+
+  async sendPrompt(
+    prompt: string,
+    config: AISessionConfig,
+    signal?: AbortSignal,
+  ): Promise<{
+    content: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    durationMs: number;
+    metadata?: Record<string, unknown>;
+  }> {
+    const client = await this.getClient();
+    const startTime = Date.now();
+    const model = config.model || DEFAULT_MODEL;
+
+    const params: Record<string, unknown> = {
+      model,
+      input: prompt,
+    };
+
+    if (config.systemPrompt) {
+      params["instructions"] = config.systemPrompt;
+    }
+
+    if (config.maxTokens) {
+      params["max_output_tokens"] = config.maxTokens;
+    }
+
+    const response = (await client.responses.create(
+      params,
+    )) as OpenAIResponse;
+    const durationMs = Date.now() - startTime;
+
+    const content = this.extractResponseText(response);
+
+    return {
+      content,
+      model: response.model,
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+      durationMs,
+      metadata: { provider: PROVIDER_NAME, mode: "sdk" },
+    };
+  }
+
+  async streamPrompt(
+    prompt: string,
+    config: AISessionConfig,
+    onChunk: (chunk: AIStreamChunk) => void,
+    signal?: AbortSignal,
+  ): Promise<{
+    content: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    durationMs: number;
+    metadata?: Record<string, unknown>;
+  }> {
+    const client = await this.getClient();
+    const startTime = Date.now();
+    const model = config.model || DEFAULT_MODEL;
+
+    const params: Record<string, unknown> = {
+      model,
+      input: prompt,
+      stream: true,
+    };
+
+    if (config.systemPrompt) {
+      params["instructions"] = config.systemPrompt;
+    }
+
+    if (config.maxTokens) {
+      params["max_output_tokens"] = config.maxTokens;
+    }
+
+    const stream = client.responses.create(
+      params,
+    ) as AsyncIterable<OpenAIStreamEvent>;
+
+    const collectedText: string[] = [];
+    let finalModel = model;
+    let inputTokens = 0;
+    let outputTokens = 0;
+
+    for await (const event of stream) {
+      if (event.type === "response.output_text.delta" && event.delta) {
+        collectedText.push(event.delta);
+        onChunk({ type: "text", content: event.delta });
+      } else if (event.type === "response.completed") {
+        const completed = event as unknown as {
+          response?: OpenAIResponse;
+        };
+        if (completed.response) {
+          finalModel = completed.response.model;
+          inputTokens = completed.response.usage.input_tokens;
+          outputTokens = completed.response.usage.output_tokens;
+        }
+      }
+    }
+
+    const durationMs = Date.now() - startTime;
+    const content = collectedText.join("");
+
+    // Fallback token estimation if streaming did not provide usage
+    if (inputTokens === 0 && outputTokens === 0) {
+      inputTokens = Math.ceil(prompt.length / 4);
+      outputTokens = Math.ceil(content.length / 4);
+    }
+
+    onChunk({ type: "done", content: "" });
+
+    return {
+      content,
+      model: finalModel,
+      inputTokens,
+      outputTokens,
+      durationMs,
+      metadata: { provider: PROVIDER_NAME, mode: "sdk" },
+    };
+  }
+
+  async healthCheck(): Promise<{ ok: boolean; message?: string }> {
+    try {
+      await this.getClient();
+      return {
+        ok: true,
+        message: `${DISPLAY_NAME} SDK ready (API key configured)`,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        message:
+          err instanceof Error ? err.message : "SDK initialization failed",
+      };
+    }
+  }
+
+  private extractResponseText(response: OpenAIResponse): string {
+    const parts: string[] = [];
+    for (const output of response.output) {
+      if (output.type === "message" && output.content) {
+        for (const block of output.content) {
+          if (block.type === "output_text" && block.text) {
+            parts.push(block.text);
+          }
+        }
+      }
+    }
+    return parts.join("");
+  }
+}
+
+// ── CLI Adapter ─────────────────────────────────────────────────────────
+
+class CodexCliAdapter implements ProviderAdapter {
+  readonly mode: ProviderMode = "cli";
+
+  private buildCliArgs(config: AISessionConfig, prompt: string): string[] {
+    const args: string[] = ["--quiet", "-a", "full-auto"];
+    if (config.model) args.push("--model", config.model);
+    args.push(prompt);
+    return args;
+  }
+
+  async sendPrompt(
+    prompt: string,
+    config: AISessionConfig,
+  ): Promise<{
+    content: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    durationMs: number;
+    metadata?: Record<string, unknown>;
+  }> {
+    const startTime = Date.now();
+    const args = this.buildCliArgs(config, prompt);
+
+    const proc = Bun.spawn([CLI_COMMAND, ...args], {
+      stdout: "pipe",
+      stderr: "pipe",
+      cwd: config.workingDirectory || process.cwd(),
+      timeout: (config.providerConfig?.["timeoutMs"] as number) || 300_000,
+    });
+
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    const durationMs = Date.now() - startTime;
+
+    if (exitCode !== 0 && !stdout) {
+      throw new Error(
+        `${DISPLAY_NAME} CLI exited with code ${exitCode}: ${stderr}`,
+      );
+    }
+
+    const content = stdout.trim() || stderr.trim();
+    // CLI does not provide real token counts; approximate from character lengths
+    const inputTokens = Math.ceil(prompt.length / 4);
+    const outputTokens = Math.ceil(content.length / 4);
+    const model = config.model || DEFAULT_MODEL;
+
+    return {
+      content,
+      model,
+      inputTokens,
+      outputTokens,
+      durationMs,
+      metadata: { exitCode, provider: PROVIDER_NAME, mode: "cli" },
+    };
+  }
+
+  async streamPrompt(
+    prompt: string,
+    config: AISessionConfig,
+    onChunk: (chunk: AIStreamChunk) => void,
+  ): Promise<{
+    content: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    durationMs: number;
+    metadata?: Record<string, unknown>;
+  }> {
+    // CLI does not support true streaming; run full prompt then emit chunks
+    const result = await this.sendPrompt(prompt, config);
+    onChunk({ type: "text", content: result.content });
+    onChunk({ type: "done", content: "" });
+    return result;
+  }
+
+  async healthCheck(): Promise<{ ok: boolean; message?: string }> {
+    try {
+      const proc = Bun.spawnSync([CLI_COMMAND, "--version"], {
+        timeout: 5000,
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      if (proc.exitCode === 0) {
+        return {
+          ok: true,
+          message: `${DISPLAY_NAME} CLI ${proc.stdout.toString().trim()}`,
+        };
+      }
+      return {
+        ok: false,
+        message: `${DISPLAY_NAME} CLI not available (exit code ${proc.exitCode})`,
+      };
+    } catch {
+      return {
+        ok: false,
+        message: `${DISPLAY_NAME} CLI not installed or not in PATH`,
+      };
+    }
+  }
+}
+
+// ── Provider Implementation ─────────────────────────────────────────────
 
 interface ManagedSession {
   id: string;
   config: AISessionConfig;
   status: AISessionStatus;
   stats: AIUsageStats;
+  abortController: AbortController | null;
+  files: AIFileAttachment[];
   createdAt: string;
   updatedAt: string;
 }
@@ -193,16 +642,71 @@ class CodexProvider implements AIAgentProvider {
   private sessions = new Map<string, ManagedSession>();
   private logIngester: LogIngester | null = null;
   private hostServices: HostServices | null = null;
+  private activeMode: ProviderMode | null = null;
+  private adapter: ProviderAdapter | null = null;
 
-  setHostServices(hs: HostServices) {
+  setHostServices(hs: HostServices): void {
     this.hostServices = hs;
     this.logIngester =
       hs.serviceRegistry?.getService<LogIngester>("ai", "log-ingester") ?? null;
   }
 
+  // ── Mode Management ──────────────────────────────────────────────────
+
+  getMode(): ProviderMode {
+    if (this.activeMode) return this.activeMode;
+    return this.detectMode();
+  }
+
+  setMode(mode: ProviderMode): void {
+    this.activeMode = mode;
+    this.adapter = null; // Force re-creation on next use
+    this.log("info", `Mode explicitly set to: ${mode}`);
+  }
+
+  private detectMode(): ProviderMode {
+    if (process.env["OPENAI_API_KEY"]) return "sdk";
+
+    try {
+      const proc = Bun.spawnSync(["which", CLI_COMMAND], {
+        timeout: 3000,
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      if (proc.exitCode === 0) return "cli";
+    } catch {
+      // CLI not found
+    }
+
+    // Default to SDK mode; healthCheck will report the actual failure
+    return "sdk";
+  }
+
+  private getAdapter(): ProviderAdapter {
+    if (this.adapter) return this.adapter;
+
+    const mode = this.getMode();
+    this.adapter =
+      mode === "sdk" ? new CodexSdkAdapter() : new CodexCliAdapter();
+    this.activeMode = mode;
+    this.log("info", `Adapter initialized in ${mode} mode`);
+    return this.adapter;
+  }
+
+  // ── Session Management ───────────────────────────────────────────────
+
   async createSession(config: AISessionConfig): Promise<AISession> {
-    const id = crypto.randomUUID();
+    const id =
+      (config.providerConfig?.["sessionId"] as string) || crypto.randomUUID();
     const now = new Date().toISOString();
+
+    // If session already exists in memory, return it
+    const existing = this.sessions.get(id);
+    if (existing) {
+      existing.status = "active";
+      existing.updatedAt = now;
+      return this.toAISession(existing);
+    }
 
     const session: ManagedSession = {
       id,
@@ -214,6 +718,8 @@ class CodexProvider implements AIAgentProvider {
         requestCount: 0,
         estimatedCostUsd: 0,
       },
+      abortController: null,
+      files: [],
       createdAt: now,
       updatedAt: now,
     };
@@ -221,17 +727,7 @@ class CodexProvider implements AIAgentProvider {
     this.sessions.set(id, session);
     this.log("info", `Session created: ${id} (${config.name})`);
 
-    return {
-      id,
-      name: config.name,
-      status: "active",
-      agentType: config.agentType,
-      provider: PROVIDER_NAME,
-      config,
-      stats: session.stats,
-      createdAt: now,
-      updatedAt: now,
-    };
+    return this.toAISession(session);
   }
 
   async sendPrompt(
@@ -239,22 +735,14 @@ class CodexProvider implements AIAgentProvider {
     prompt: string,
     context?: AIContext[],
   ): Promise<AIResponse> {
-    const session = this.sessions.get(sessionId);
-    if (!session) throw new Error(`Session ${sessionId} not found`);
-    if (session.status === "terminated")
-      throw new Error("Session is terminated");
-
+    const session = this.getSession(sessionId);
     session.status = "processing";
     session.updatedAt = new Date().toISOString();
-    const startTime = Date.now();
 
-    let fullPrompt = prompt;
-    if (context && context.length > 0) {
-      const contextStr = context
-        .map((c) => `--- Context (${c.type}): ---\n${c.content}`)
-        .join("\n\n");
-      fullPrompt = `${prompt}\n\n${contextStr}`;
-    }
+    const abortController = new AbortController();
+    session.abortController = abortController;
+
+    const fullPrompt = this.buildFullPrompt(prompt, context, session.files);
 
     this.logIngester?.append({
       sessionId,
@@ -263,53 +751,31 @@ class CodexProvider implements AIAgentProvider {
     });
 
     try {
-      const args = this.buildCliArgs(session.config, fullPrompt);
-      const proc = Bun.spawn([CLI_COMMAND, ...args], {
-        stdout: "pipe",
-        stderr: "pipe",
-        cwd: session.config.workingDirectory || process.cwd(),
-        timeout:
-          (session.config.providerConfig?.timeoutMs as number) || 300_000,
-      });
+      const adapter = this.getAdapter();
+      const result = await adapter.sendPrompt(
+        fullPrompt,
+        session.config,
+        abortController.signal,
+      );
 
-      const stdout = await new Response(proc.stdout).text();
-      const stderr = await new Response(proc.stderr).text();
-      const exitCode = await proc.exited;
-      const durationMs = Date.now() - startTime;
-
-      if (exitCode !== 0 && !stdout) {
-        throw new Error(
-          `${DISPLAY_NAME} exited with code ${exitCode}: ${stderr}`,
-        );
-      }
-
-      const content = stdout.trim() || stderr.trim();
-      const inputTokens = Math.ceil(fullPrompt.length / 4);
-      const outputTokens = Math.ceil(content.length / 4);
-      const model = (session.config.model as string) || "default";
-
-      session.stats.inputTokens += inputTokens;
-      session.stats.outputTokens += outputTokens;
-      session.stats.requestCount += 1;
-      session.status = "active";
-      session.updatedAt = new Date().toISOString();
+      this.updateSessionStats(session, result.inputTokens, result.outputTokens);
 
       this.logIngester?.append({
         sessionId,
         type: "output",
-        content,
-        tokenCount: outputTokens,
-        model,
-        durationMs,
+        content: result.content,
+        tokenCount: result.outputTokens,
+        model: result.model,
+        durationMs: result.durationMs,
       });
 
       return {
-        content,
-        model,
-        inputTokens,
-        outputTokens,
-        durationMs,
-        metadata: { exitCode, provider: PROVIDER_NAME },
+        content: result.content,
+        model: result.model,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        durationMs: result.durationMs,
+        metadata: result.metadata,
       };
     } catch (err) {
       session.status = "error";
@@ -323,15 +789,126 @@ class CodexProvider implements AIAgentProvider {
       });
 
       throw err;
+    } finally {
+      session.abortController = null;
     }
   }
 
-  private buildCliArgs(config: AISessionConfig, prompt: string): string[] {
-    const args: string[] = ["--quiet", "-a", "full-auto"];
-    if (config.model) args.push("--model", config.model);
-    args.push(prompt);
-    return args;
+  async streamPrompt(
+    sessionId: string,
+    prompt: string,
+    context?: AIContext[],
+    onChunk?: (chunk: AIStreamChunk) => void,
+  ): Promise<AIResponse> {
+    const session = this.getSession(sessionId);
+    session.status = "processing";
+    session.updatedAt = new Date().toISOString();
+
+    const abortController = new AbortController();
+    session.abortController = abortController;
+
+    const fullPrompt = this.buildFullPrompt(prompt, context, session.files);
+
+    this.logIngester?.append({
+      sessionId,
+      type: "input",
+      content: prompt,
+    });
+
+    try {
+      const adapter = this.getAdapter();
+      const chunkHandler = onChunk ?? ((_c: AIStreamChunk) => {});
+
+      const result = await adapter.streamPrompt(
+        fullPrompt,
+        session.config,
+        chunkHandler,
+        abortController.signal,
+      );
+
+      this.updateSessionStats(session, result.inputTokens, result.outputTokens);
+
+      this.logIngester?.append({
+        sessionId,
+        type: "output",
+        content: result.content,
+        tokenCount: result.outputTokens,
+        model: result.model,
+        durationMs: result.durationMs,
+      });
+
+      return {
+        content: result.content,
+        model: result.model,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        durationMs: result.durationMs,
+        metadata: result.metadata,
+      };
+    } catch (err) {
+      session.status = "error";
+      session.updatedAt = new Date().toISOString();
+
+      const errorMsg = err instanceof Error ? err.message : "Unknown error";
+      this.logIngester?.append({
+        sessionId,
+        type: "error",
+        content: errorMsg,
+      });
+
+      throw err;
+    } finally {
+      session.abortController = null;
+    }
   }
+
+  // ── Extended Methods ─────────────────────────────────────────────────
+
+  async listModels(): Promise<AIModelInfo[]> {
+    return [...CODEX_MODELS];
+  }
+
+  async cancelRequest(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session ${sessionId} not found`);
+
+    if (session.abortController) {
+      session.abortController.abort();
+      session.abortController = null;
+      session.status = "active";
+      session.updatedAt = new Date().toISOString();
+      this.log("info", `Request cancelled for session: ${sessionId}`);
+    }
+  }
+
+  getCapabilities(): AIProviderCapabilities {
+    const mode = this.getMode();
+    return {
+      streaming: mode === "sdk",
+      vision: mode === "sdk",
+      fileAttachments: true,
+      toolUse: false,
+      mcpSupport: false,
+      voiceMode: false,
+      cancelSupport: mode === "sdk",
+      modelListing: true,
+    };
+  }
+
+  async attachFiles(
+    sessionId: string,
+    files: AIFileAttachment[],
+  ): Promise<void> {
+    const session = this.getSession(sessionId);
+    session.files.push(...files);
+    session.updatedAt = new Date().toISOString();
+    this.log(
+      "debug",
+      `Attached ${files.length} file(s) to session ${sessionId}`,
+    );
+  }
+
+  // ── Standard Methods ─────────────────────────────────────────────────
 
   async getSessionLogs(
     _sessionId: string,
@@ -356,8 +933,7 @@ class CodexProvider implements AIAgentProvider {
     sessionId: string,
     config: Partial<AISessionConfig>,
   ): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (!session) throw new Error(`Session ${sessionId} not found`);
+    const session = this.getSession(sessionId);
     Object.assign(session.config, config);
     session.updatedAt = new Date().toISOString();
   }
@@ -365,14 +941,108 @@ class CodexProvider implements AIAgentProvider {
   async destroySession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (session) {
+      if (session.abortController) {
+        session.abortController.abort();
+        session.abortController = null;
+      }
       session.status = "terminated";
+      session.files = [];
       session.updatedAt = new Date().toISOString();
       this.log("info", `Session terminated: ${sessionId}`);
     }
   }
 
   async listSessions(): Promise<AISession[]> {
-    return Array.from(this.sessions.values()).map((s) => ({
+    return Array.from(this.sessions.values()).map((s) => this.toAISession(s));
+  }
+
+  async getSessionStatus(sessionId: string): Promise<AISessionStatus> {
+    return this.sessions.get(sessionId)?.status ?? "terminated";
+  }
+
+  async healthCheck(): Promise<{ ok: boolean; message?: string }> {
+    const adapter = this.getAdapter();
+    return adapter.healthCheck();
+  }
+
+  // ── Private Helpers ──────────────────────────────────────────────────
+
+  private getSession(sessionId: string): ManagedSession {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session ${sessionId} not found`);
+    if (session.status === "terminated")
+      throw new Error("Session is terminated");
+    return session;
+  }
+
+  private buildFullPrompt(
+    prompt: string,
+    context?: AIContext[],
+    files?: AIFileAttachment[],
+  ): string {
+    let fullPrompt = prompt;
+
+    if (context && context.length > 0) {
+      const contextStr = context
+        .map((c) => `--- Context (${c.type}): ---\n${c.content}`)
+        .join("\n\n");
+      fullPrompt = `${prompt}\n\n${contextStr}`;
+    }
+
+    if (files && files.length > 0) {
+      const fileStr = files
+        .map((f) => {
+          const textContent =
+            typeof f.content === "string"
+              ? f.content
+              : f.content.toString("utf-8");
+          return `--- File: ${f.filename} (${f.mimeType}, ${f.size} bytes) ---\n${textContent}`;
+        })
+        .join("\n\n");
+      fullPrompt = `${fullPrompt}\n\n${fileStr}`;
+    }
+
+    return fullPrompt;
+  }
+
+  private updateSessionStats(
+    session: ManagedSession,
+    inputTokens: number,
+    outputTokens: number,
+  ): void {
+    const model = session.config.model || DEFAULT_MODEL;
+    const modelInfo = CODEX_MODELS.find((m) => m.id === model);
+
+    session.stats.inputTokens += inputTokens;
+    session.stats.outputTokens += outputTokens;
+    session.stats.requestCount += 1;
+
+    if (modelInfo) {
+      const cost =
+        (inputTokens / 1_000_000) * modelInfo.inputPricePerMToken +
+        (outputTokens / 1_000_000) * modelInfo.outputPricePerMToken;
+      session.stats.estimatedCostUsd += cost;
+    }
+
+    if (!session.stats.modelBreakdown) {
+      session.stats.modelBreakdown = {};
+    }
+    const breakdown = session.stats.modelBreakdown[model] ?? {
+      inputTokens: 0,
+      outputTokens: 0,
+      requestCount: 0,
+    };
+    breakdown.inputTokens += inputTokens;
+    breakdown.outputTokens += outputTokens;
+    breakdown.requestCount += 1;
+    session.stats.modelBreakdown[model] = breakdown;
+
+    session.status = "active";
+    session.updatedAt = new Date().toISOString();
+  }
+
+  private toAISession(s: ManagedSession): AISession {
+    return {
       id: s.id,
       name: s.config.name,
       status: s.status,
@@ -382,39 +1052,10 @@ class CodexProvider implements AIAgentProvider {
       stats: s.stats,
       createdAt: s.createdAt,
       updatedAt: s.updatedAt,
-    }));
+    };
   }
 
-  async getSessionStatus(sessionId: string): Promise<AISessionStatus> {
-    return this.sessions.get(sessionId)?.status ?? "terminated";
-  }
-
-  async healthCheck(): Promise<{ ok: boolean; message?: string }> {
-    try {
-      const proc = Bun.spawnSync([CLI_COMMAND, "--version"], {
-        timeout: 5000,
-        stdout: "pipe",
-        stderr: "ignore",
-      });
-      if (proc.exitCode === 0) {
-        return {
-          ok: true,
-          message: `${DISPLAY_NAME} ${proc.stdout.toString().trim()}`,
-        };
-      }
-      return {
-        ok: false,
-        message: `${DISPLAY_NAME} not available (exit code ${proc.exitCode})`,
-      };
-    } catch {
-      return {
-        ok: false,
-        message: `${DISPLAY_NAME} not installed or not in PATH`,
-      };
-    }
-  }
-
-  private log(level: "info" | "error" | "debug", msg: string) {
+  private log(level: "info" | "error" | "debug", msg: string): void {
     this.hostServices?.logger?.[level]?.(`${PROVIDER_NAME}-provider`, msg);
   }
 }
@@ -426,7 +1067,8 @@ const provider = new CodexProvider();
 export const vibePlugin: VibePlugin = {
   name: "codex",
   version: "1.0.0",
-  description: "OpenAI Codex AI agent provider for VibeControls",
+  description:
+    "OpenAI Codex AI agent provider for VibeControls (dual-mode: SDK + CLI)",
   tags: ["provider", "integration"],
   providers: { ai: provider },
 
