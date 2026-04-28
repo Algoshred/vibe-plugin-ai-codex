@@ -1,6 +1,6 @@
 {
-  "name": "@vibecontrols/vibe-plugin-codex",
-  "version": "2026.428.1",
+  "name": "@vibecontrols/vibe-plugin-ai-codex",
+  "version": "2026.428.3",
   "type": "module",
   "main": "./dist/index.js",
   "description": "OpenAI Codex AI agent provider for VibeControls Agent",
@@ -57,14 +57,14 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/algoshred/vibe-plugin-codex.git"
+    "url": "git+https://github.com/algoshred/vibe-plugin-ai-codex.git"
   },
   "bugs": {
-    "url": "https://github.com/algoshred/vibe-plugin-codex/issues"
+    "url": "https://github.com/algoshred/vibe-plugin-ai-codex/issues"
   },
   "homepage": "https://vibecontrols.com",
   "publishConfig": {
-    "access": "restricted",
+    "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
   "files": [
