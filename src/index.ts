@@ -10,6 +10,8 @@
  * binary is found, error if neither is available.
  */
 
+import { Elysia } from "elysia";
+
 // ── Locally Redeclared Interfaces ────────────────────────────────────────
 // (Avoid hard dependency on @vibecontrols/agent)
 
@@ -54,6 +56,13 @@ interface VibePlugin {
   >;
   cliCommand?: string;
   apiPrefix?: string;
+  prerequisites?: Array<{
+    name: string;
+    kind: "binary" | "npm" | "pip" | "cargo" | "manual";
+    requiresSudo: boolean;
+    description?: string;
+  }>;
+  createRoutes?: () => unknown;
   providers?: { ai?: AIAgentProvider; [key: string]: unknown };
   onServerStart?: (
     app: unknown,
@@ -258,6 +267,9 @@ const CLI_COMMAND = "codex";
 const DISPLAY_NAME = "OpenAI Codex";
 const DEFAULT_MODEL = "gpt-4.1-mini";
 const DEFAULT_MAX_TOKENS = 16_384;
+const API_PREFIX = `/api/ai-${PROVIDER_NAME}`;
+const SUPPORTED_MODES: ProviderMode[] = ["sdk", "cli"];
+const CLI_INSTALL_COMMAND = ["npm", "install", "-g", "@openai/codex"];
 
 const CODEX_MODELS: AIModelInfo[] = [
   {
@@ -330,7 +342,10 @@ interface OpenAIClient {
 
 interface OpenAIResponse {
   id: string;
-  output: Array<{ type: string; content?: Array<{ type: string; text?: string }> }>;
+  output: Array<{
+    type: string;
+    content?: Array<{ type: string; text?: string }>;
+  }>;
   model: string;
   usage: {
     input_tokens: number;
@@ -394,9 +409,7 @@ class CodexSdkAdapter implements ProviderAdapter {
       params["max_output_tokens"] = config.maxTokens;
     }
 
-    const response = (await client.responses.create(
-      params,
-    )) as OpenAIResponse;
+    const response = (await client.responses.create(params)) as OpenAIResponse;
     const durationMs = Date.now() - startTime;
 
     const content = this.extractResponseText(response);
@@ -651,6 +664,18 @@ class CodexProvider implements AIAgentProvider {
       hs.serviceRegistry?.getService<LogIngester>("ai", "log-ingester") ?? null;
   }
 
+  getSupportedModes(): ProviderMode[] {
+    return [...SUPPORTED_MODES];
+  }
+
+  getDisplayName(): string {
+    return DISPLAY_NAME;
+  }
+
+  getPrereqApiPrefix(): string {
+    return API_PREFIX;
+  }
+
   // ── Mode Management ──────────────────────────────────────────────────
 
   getMode(): ProviderMode {
@@ -659,6 +684,9 @@ class CodexProvider implements AIAgentProvider {
   }
 
   setMode(mode: ProviderMode): void {
+    if (!SUPPORTED_MODES.includes(mode)) {
+      throw new Error(`${DISPLAY_NAME} does not support ${mode} mode`);
+    }
     this.activeMode = mode;
     this.adapter = null; // Force re-creation on next use
     this.log("info", `Mode explicitly set to: ${mode}`);
@@ -1062,6 +1090,77 @@ class CodexProvider implements AIAgentProvider {
 
 // ── Plugin Export ────────────────────────────────────────────────────────
 
+function getCliVersion(): string | null {
+  try {
+    const proc = Bun.spawnSync([CLI_COMMAND, "--version"], {
+      timeout: 5000,
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (proc.exitCode === 0) return proc.stdout.toString().trim();
+  } catch {
+    // Binary not found.
+  }
+  return null;
+}
+
+function createPrereqsRoutes() {
+  return new Elysia({ prefix: "/prereqs" })
+    .get("/status", () => {
+      const version = getCliVersion();
+      return {
+        satisfied: Boolean(version),
+        missing: version
+          ? []
+          : [
+              {
+                name: CLI_COMMAND,
+                kind: "npm" as const,
+                requiresSudo: false,
+                description: `${DISPLAY_NAME} CLI for CLI mode`,
+              },
+            ],
+      };
+    })
+    .post("/install", () => {
+      if (getCliVersion()) {
+        return {
+          ok: true,
+          installed: [CLI_COMMAND],
+          pendingSudo: [],
+          errors: [],
+        };
+      }
+
+      const proc = Bun.spawnSync(CLI_INSTALL_COMMAND, {
+        timeout: 120_000,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (proc.exitCode === 0) {
+        return {
+          ok: true,
+          installed: [CLI_COMMAND],
+          pendingSudo: [],
+          errors: [],
+        };
+      }
+      return {
+        ok: false,
+        installed: [],
+        pendingSudo: [],
+        errors: [
+          {
+            name: CLI_COMMAND,
+            message:
+              proc.stderr.toString().trim() ||
+              `Run manually: ${CLI_INSTALL_COMMAND.join(" ")}`,
+          },
+        ],
+      };
+    });
+}
+
 const provider = new CodexProvider();
 
 export const vibePlugin: VibePlugin = {
@@ -1070,7 +1169,17 @@ export const vibePlugin: VibePlugin = {
   description:
     "OpenAI Codex AI agent provider for VibeControls (dual-mode: SDK + CLI)",
   tags: ["provider", "integration"],
+  apiPrefix: API_PREFIX,
+  prerequisites: [
+    {
+      name: CLI_COMMAND,
+      kind: "npm",
+      requiresSudo: false,
+      description: `${DISPLAY_NAME} CLI for CLI mode`,
+    },
+  ],
   providers: { ai: provider },
+  createRoutes: () => createPrereqsRoutes(),
 
   onServerStart(_app, hostServices) {
     if (hostServices) provider.setHostServices(hostServices);
