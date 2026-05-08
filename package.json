@@ -1,6 +1,6 @@
 {
   "name": "@vibecontrols/vibe-plugin-ai-codex",
-  "version": "2026.508.3",
+  "version": "2026.508.4",
   "type": "module",
   "main": "./dist/index.js",
   "description": "OpenAI Codex AI agent provider for VibeControls Agent",
@@ -42,7 +42,7 @@
   },
   "peerDependencies": {
     "@vibecontrols/agent": ">=2.0.0",
-    "@vibecontrols/vibe-plugin-ai": "^2026.506.6"
+    "@vibecontrols/vibe-plugin-ai": "2026.508.5"
   },
   "peerDependenciesMeta": {
     "@vibecontrols/agent": {
