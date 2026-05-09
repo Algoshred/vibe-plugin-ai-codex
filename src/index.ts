@@ -11,9 +11,16 @@
  */
 
 import { Elysia } from "elysia";
+import type { HostServices, VibePlugin } from "@vibecontrols/plugin-sdk";
+import {
+  BoundLogger,
+  ProviderRegistry,
+  TelemetryEmitter,
+  createLifecycleHooks,
+} from "@vibecontrols/plugin-sdk";
 
-// ── Locally Redeclared Interfaces ────────────────────────────────────────
-// (Avoid hard dependency on @vibecontrols/agent)
+// ── AI Provider Contract Types ──────────────────────────────────────────
+// (provider-specific contract — kept inline; not part of the SDK surface)
 
 type ProviderMode = "sdk" | "cli";
 
@@ -45,61 +52,6 @@ interface AIFileAttachment {
   mimeType: string;
   content: Buffer | string;
   size: number;
-}
-
-interface PluginCapabilities {
-  storage?: "none" | "read" | "rw";
-  secrets?: "none" | "read" | "rw";
-  gateway?: boolean;
-  broadcast?: boolean;
-  subprocess?: boolean;
-  audit?: boolean;
-  telemetry?: boolean;
-}
-
-interface VibePlugin {
-  capabilities?: PluginCapabilities;
-  name: string;
-  version: string;
-  description?: string;
-  tags?: Array<
-    "backend" | "frontend" | "cli" | "provider" | "adapter" | "integration"
-  >;
-  cliCommand?: string;
-  apiPrefix?: string;
-  prerequisites?: Array<{
-    name: string;
-    kind: "binary" | "npm" | "pip" | "cargo" | "manual";
-    requiresSudo: boolean;
-    description?: string;
-  }>;
-  createRoutes?: () => unknown;
-  providers?: { ai?: AIAgentProvider; [key: string]: unknown };
-  onServerStart?: (
-    app: unknown,
-    hostServices?: HostServices,
-  ) => void | Promise<void>;
-  onServerStop?: () => void | Promise<void>;
-  onCliSetup?: (
-    program: unknown,
-    hostServices?: HostServices,
-  ) => void | Promise<void>;
-}
-
-interface HostServices {
-  telemetry?: {
-    emit: (name: string, payload?: Record<string, unknown>) => void;
-  };
-  logger?: {
-    info: (source: string, msg: string) => void;
-    warn: (source: string, msg: string) => void;
-    error: (source: string, msg: string) => void;
-    debug: (source: string, msg: string) => void;
-  };
-  serviceRegistry?: {
-    getService: <T>(pluginName: string, serviceName: string) => T | undefined;
-  };
-  getConfig: (key: string) => string | undefined;
 }
 
 type AISessionStatus =
@@ -258,7 +210,7 @@ interface ProviderAdapter {
   sendPrompt(
     prompt: string,
     config: AISessionConfig,
-    signal?: AbortSignal,
+    _signal?: AbortSignal,
   ): Promise<{
     content: string;
     model: string;
@@ -272,7 +224,7 @@ interface ProviderAdapter {
     prompt: string,
     config: AISessionConfig,
     onChunk: (chunk: AIStreamChunk) => void,
-    signal?: AbortSignal,
+    _signal?: AbortSignal,
   ): Promise<{
     content: string;
     model: string;
@@ -423,7 +375,7 @@ class CodexSdkAdapter implements ProviderAdapter {
   async sendPrompt(
     prompt: string,
     config: AISessionConfig,
-    signal?: AbortSignal,
+    _signal?: AbortSignal,
   ): Promise<{
     content: string;
     model: string;
@@ -468,7 +420,7 @@ class CodexSdkAdapter implements ProviderAdapter {
     prompt: string,
     config: AISessionConfig,
     onChunk: (chunk: AIStreamChunk) => void,
-    signal?: AbortSignal,
+    _signal?: AbortSignal,
   ): Promise<{
     content: string;
     model: string;
@@ -695,13 +647,16 @@ class CodexProvider implements AIAgentProvider {
   private sessions = new Map<string, ManagedSession>();
   private logIngester: LogIngester | null = null;
   private hostServices: HostServices | null = null;
+  private logger: BoundLogger | null = null;
   private activeMode: ProviderMode | null = null;
   private adapter: ProviderAdapter | null = null;
 
   setHostServices(hs: HostServices): void {
     this.hostServices = hs;
+    this.logger = new BoundLogger(hs.logger, `${PROVIDER_NAME}-provider`);
+    const registry = new ProviderRegistry(hs);
     this.logIngester =
-      hs.serviceRegistry?.getService<LogIngester>("ai", "log-ingester") ?? null;
+      registry.getProvider<LogIngester>("ai", "log-ingester") ?? null;
   }
 
   getSupportedModes(): ProviderMode[] {
@@ -1159,7 +1114,7 @@ class CodexProvider implements AIAgentProvider {
   }
 
   private log(level: "info" | "error" | "debug", msg: string): void {
-    this.hostServices?.logger?.[level]?.(`${PROVIDER_NAME}-provider`, msg);
+    this.logger?.[level](msg);
   }
 }
 
@@ -1236,17 +1191,41 @@ function createPrereqsRoutes() {
     });
 }
 
+const PLUGIN_NAME = "codex";
+const PLUGIN_VERSION = "1.0.0";
+
 const provider = new CodexProvider();
 
-export const vibePlugin: VibePlugin = {
+const lifecycle = createLifecycleHooks({
+  name: PLUGIN_NAME,
+  telemetryEventName: "ai.provider.ready",
+  onInit: (hostServices: HostServices) => {
+    provider.setHostServices(hostServices);
+    new TelemetryEmitter(PLUGIN_NAME, PLUGIN_VERSION, hostServices).emit(
+      "ai.provider.ready",
+      { provider: PLUGIN_NAME },
+    );
+  },
+  onShutdown: () => {
+    for (const [id] of (provider as CodexProvider)["sessions"]) {
+      provider.destroySession(id).catch(() => {});
+    }
+  },
+});
+
+type CodexVibePlugin = VibePlugin & {
+  providers?: { ai?: AIAgentProvider };
+};
+
+export const vibePlugin: CodexVibePlugin = {
   capabilities: {
     secrets: "read",
     subprocess: true,
     gateway: false,
     telemetry: true,
   },
-  name: "codex",
-  version: "1.0.0",
+  name: PLUGIN_NAME,
+  version: PLUGIN_VERSION,
   description:
     "OpenAI Codex AI agent provider for VibeControls (dual-mode: SDK + CLI)",
   tags: ["provider", "integration"],
@@ -1256,22 +1235,12 @@ export const vibePlugin: VibePlugin = {
       name: CLI_COMMAND,
       kind: "npm",
       requiresSudo: false,
-      description: `${DISPLAY_NAME} CLI for CLI mode`,
     },
   ],
   providers: { ai: provider },
   createRoutes: () => createPrereqsRoutes(),
-
-  onServerStart(_app, hostServices) {
-    hostServices?.telemetry?.emit("ai.provider.ready", { provider: "codex" });
-    if (hostServices) provider.setHostServices(hostServices);
-  },
-
-  onServerStop() {
-    for (const [id] of (provider as CodexProvider)["sessions"]) {
-      provider.destroySession(id).catch(() => {});
-    }
-  },
+  onServerStart: lifecycle.onServerStart,
+  onServerStop: lifecycle.onServerStop,
 };
 
 export default vibePlugin;
