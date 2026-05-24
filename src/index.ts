@@ -72,7 +72,7 @@ type AILogType =
   | "error"
   | "metadata";
 
-type PermissionMode = "plan" | "acceptEdits" | "fullAuto";
+export type PermissionMode = "plan" | "acceptEdits" | "fullAuto";
 
 interface AISessionConfig {
   name: string;
@@ -536,16 +536,20 @@ class CodexSdkAdapter implements ProviderAdapter {
 
 /**
  * Map the provider-agnostic permission mode to Codex CLI approval/sandbox
- * flags (`codex --help`: -a/--ask-for-approval, --sandbox, --full-auto).
- * Unknown/undefined falls back to the safe default (acceptEdits) — never
- * the most-permissive level. Flags are CLI-version-dependent.
+ * flags (`codex --help`: -a/--ask-for-approval {untrusted|on-request|never},
+ * --sandbox {read-only|workspace-write}). We use the explicit `-a`/`--sandbox`
+ * pair for every level (including fullAuto → `-a never --sandbox workspace-write`,
+ * the documented expansion of the `--full-auto` convenience flag) so the mapping
+ * is unambiguous and stable across CLI versions rather than depending on the
+ * `--full-auto` shorthand existing. Unknown/undefined → acceptEdits (never the
+ * most-permissive level). Flags are CLI-version-dependent.
  */
 export function permissionFlags(mode: PermissionMode | undefined): string[] {
   switch (mode) {
     case "plan":
       return ["-a", "untrusted", "--sandbox", "read-only"];
     case "fullAuto":
-      return ["--full-auto"];
+      return ["-a", "never", "--sandbox", "workspace-write"];
     case "acceptEdits":
     default:
       return ["-a", "on-request", "--sandbox", "workspace-write"];
@@ -556,7 +560,10 @@ class CodexCliAdapter implements ProviderAdapter {
   readonly mode: ProviderMode = "cli";
 
   private buildCliArgs(config: AISessionConfig, prompt: string): string[] {
-    const args: string[] = ["--quiet", ...permissionFlags(config.permissionMode)];
+    const args: string[] = [
+      "--quiet",
+      ...permissionFlags(config.permissionMode),
+    ];
     if (config.model) args.push("--model", config.model);
     args.push(prompt);
     return args;

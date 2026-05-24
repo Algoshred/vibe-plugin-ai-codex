@@ -21,8 +21,13 @@ describe("codex permissionFlags", () => {
     ]);
   });
 
-  it("fullAuto → --full-auto", () => {
-    expect(permissionFlags("fullAuto")).toEqual(["--full-auto"]);
+  it("fullAuto → never-ask + workspace-write (stable expansion of --full-auto)", () => {
+    expect(permissionFlags("fullAuto")).toEqual([
+      "-a",
+      "never",
+      "--sandbox",
+      "workspace-write",
+    ]);
   });
 
   it("undefined / unknown → acceptEdits (never most-permissive)", () => {
