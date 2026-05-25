@@ -1,0 +1,11 @@
+groups:
+  - name: team
+    reviewers: 1
+    internal_reviewers: 1
+    usernames:
+      - cv-arun
+      - GauDan-2005
+      - kruthika-15
+      - Riojaikumar
+      - ShauryaSood2003
+      - vadivelan1998

@@ -69,6 +69,25 @@ jobs:
       - name: Build
         run: bun run build
 
+  # Aggregator status required by the `main` branch ruleset. Without a job that
+  # reports a "PR Gate" check, the required context sits at
+  # "Expected — Waiting for status to be reported" forever and blocks the PR.
+  pr-gate:
+    name: PR Gate
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check results
+        run: |
+          result="${{ needs.test.result }}"
+          if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+            echo "::error::Test & Build $result — PR Gate fails"
+            exit 1
+          fi
+          echo "Test & Build passed — PR Gate green"
+
   publish-npmjs:
     name: Publish to npmjs
     needs: test

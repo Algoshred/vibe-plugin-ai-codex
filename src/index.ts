@@ -72,6 +72,8 @@ type AILogType =
   | "error"
   | "metadata";
 
+export type PermissionMode = "plan" | "acceptEdits" | "fullAuto";
+
 interface AISessionConfig {
   name: string;
   agentType: string;
@@ -80,6 +82,8 @@ interface AISessionConfig {
   temperature?: number;
   systemPrompt?: string;
   workingDirectory?: string;
+  /** Autonomy level for CLI mode; ignored by the SDK adapter. */
+  permissionMode?: PermissionMode;
   providerConfig?: Record<string, unknown>;
 }
 
@@ -530,11 +534,36 @@ class CodexSdkAdapter implements ProviderAdapter {
 
 // ── CLI Adapter ─────────────────────────────────────────────────────────
 
+/**
+ * Map the provider-agnostic permission mode to Codex CLI approval/sandbox
+ * flags (`codex --help`: -a/--ask-for-approval {untrusted|on-request|never},
+ * --sandbox {read-only|workspace-write}). We use the explicit `-a`/`--sandbox`
+ * pair for every level (including fullAuto → `-a never --sandbox workspace-write`,
+ * the documented expansion of the `--full-auto` convenience flag) so the mapping
+ * is unambiguous and stable across CLI versions rather than depending on the
+ * `--full-auto` shorthand existing. Unknown/undefined → acceptEdits (never the
+ * most-permissive level). Flags are CLI-version-dependent.
+ */
+export function permissionFlags(mode: PermissionMode | undefined): string[] {
+  switch (mode) {
+    case "plan":
+      return ["-a", "untrusted", "--sandbox", "read-only"];
+    case "fullAuto":
+      return ["-a", "never", "--sandbox", "workspace-write"];
+    case "acceptEdits":
+    default:
+      return ["-a", "on-request", "--sandbox", "workspace-write"];
+  }
+}
+
 class CodexCliAdapter implements ProviderAdapter {
   readonly mode: ProviderMode = "cli";
 
   private buildCliArgs(config: AISessionConfig, prompt: string): string[] {
-    const args: string[] = ["--quiet", "-a", "full-auto"];
+    const args: string[] = [
+      "--quiet",
+      ...permissionFlags(config.permissionMode),
+    ];
     if (config.model) args.push("--model", config.model);
     args.push(prompt);
     return args;
