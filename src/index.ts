@@ -254,13 +254,17 @@ const CLI_COMMAND = "codex";
  * On Windows, Bun.spawn calls CreateProcess directly (no PATHEXT), so a bare
  * name won't find `name.exe`/`name.cmd`. Bun.which searches PATH like the shell.
  */
+function platformExeName(base: string): string {
+  return process.platform === "win32" ? `${base}.exe` : base;
+}
+
 function resolveCliBin(): string {
   const found =
     typeof Bun !== "undefined" && typeof Bun.which === "function"
       ? Bun.which(CLI_COMMAND)
       : null;
   if (found) return found;
-  return process.platform === "win32" ? `${CLI_COMMAND}.exe` : CLI_COMMAND;
+  return platformExeName(CLI_COMMAND);
 }
 const CLI_BIN = resolveCliBin();
 
