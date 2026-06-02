@@ -10,6 +10,9 @@
  * binary is found, error if neither is available.
  */
 
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Elysia } from "elysia";
 import type {
   HostServices,
@@ -273,7 +276,7 @@ const DEFAULT_MODEL = "gpt-4.1-mini";
 const DEFAULT_MAX_TOKENS = 16_384;
 const API_PREFIX = `/api/ai-${PROVIDER_NAME}`;
 const SUPPORTED_MODES: ProviderMode[] = ["sdk", "cli"];
-const CLI_INSTALL_COMMAND = ["npm", "install", "-g", "@openai/codex"];
+const CLI_NPM_PACKAGE = "@openai/codex";
 
 const CODEX_MODELS: AIModelInfo[] = [
   {
@@ -366,22 +369,42 @@ interface OpenAIStreamEvent {
 class CodexSdkAdapter implements ProviderAdapter {
   readonly mode: ProviderMode = "sdk";
   private client: OpenAIClient | null = null;
+  private readonly resolveApiKey: () => Promise<string | undefined>;
+
+  /**
+   * Takes an async resolver so the key is read fresh from env OR the agent
+   * config bag the frontend writes to (PUT /api/config/OPENAI_API_KEY) at
+   * first use, rather than only from process.env at construction time.
+   */
+  constructor(resolveApiKey: () => Promise<string | undefined>) {
+    this.resolveApiKey = resolveApiKey;
+  }
 
   private async getClient(): Promise<OpenAIClient> {
     if (this.client) return this.client;
 
+    const apiKey = (await this.resolveApiKey())?.trim();
+    if (!apiKey) {
+      throw new Error(
+        "OPENAI_API_KEY is required for SDK mode. Set it in the AI provider " +
+          "credentials (stored in the agent config) or export it in the agent " +
+          "environment.",
+      );
+    }
+
+    let OpenAI: new (opts: { apiKey: string }) => unknown;
     try {
       const mod = await import("openai");
-      const OpenAI = mod.default ?? mod;
-      this.client = new OpenAI({
-        apiKey: process.env["OPENAI_API_KEY"],
-      }) as unknown as OpenAIClient;
-      return this.client;
+      OpenAI = (mod.default ?? mod) as new (opts: {
+        apiKey: string;
+      }) => unknown;
     } catch {
       throw new Error(
         "Failed to load openai SDK. Install it with: bun add openai",
       );
     }
+    this.client = new OpenAI({ apiKey }) as unknown as OpenAIClient;
+    return this.client;
   }
 
   async sendPrompt(
@@ -551,26 +574,106 @@ class CodexSdkAdapter implements ProviderAdapter {
 export function permissionFlags(mode: PermissionMode | undefined): string[] {
   switch (mode) {
     case "plan":
-      return ["-a", "untrusted", "--sandbox", "read-only"];
+      // Read-only sandbox: the model can inspect but never mutate or escalate.
+      return ["--sandbox", "read-only"];
     case "fullAuto":
-      return ["-a", "never", "--sandbox", "workspace-write"];
+      // Non-interactive auto-run. `--full-auto` maps to `-a on-request`, which
+      // would BLOCK on an approval prompt under `exec` (no TTY) — so we use the
+      // bypass flag, which is safe because the agent already runs inside the
+      // vibecontrols sandbox container.
+      return ["--dangerously-bypass-approvals-and-sandbox"];
     case "acceptEdits":
     default:
-      return ["-a", "on-request", "--sandbox", "workspace-write"];
+      // Writes confined to the workspace; no interactive approval under exec.
+      return ["--sandbox", "workspace-write"];
   }
 }
 
 class CodexCliAdapter implements ProviderAdapter {
   readonly mode: ProviderMode = "cli";
+  private readonly resolveApiKey: () => Promise<string | undefined>;
+  private loggedInKey: string | null = null;
 
+  constructor(resolveApiKey: () => Promise<string | undefined>) {
+    this.resolveApiKey = resolveApiKey;
+  }
+
+  /**
+   * Codex CLI auth dir. We keep it OFF the operator's default `~/.codex` so
+   * an API key the user saved in the agent never clobbers (or is shadowed by)
+   * a personal `codex login`. An explicit CODEX_HOME still wins for operators
+   * who deliberately set one.
+   */
+  private codexHome(): string {
+    const home =
+      process.env["CODEX_HOME"]?.trim() || join(tmpdir(), "vibe-codex-home");
+    try {
+      mkdirSync(home, { recursive: true });
+    } catch {
+      /* best effort — exec will surface a real error if the dir is unusable */
+    }
+    return home;
+  }
+
+  /**
+   * Modern Codex authenticates from `auth.json` (written by `codex login`),
+   * NOT from the OPENAI_API_KEY env var, so injecting the env alone leaves it
+   * unauthenticated. When the user has saved a key we write it into our scoped
+   * CODEX_HOME via `codex login --with-api-key` (reads the key from stdin),
+   * once per distinct key. With no key we leave whatever auth already exists.
+   */
+  private async ensureAuth(home: string): Promise<void> {
+    const apiKey = (await this.resolveApiKey())?.trim();
+    if (!apiKey || apiKey === this.loggedInKey) return;
+    const proc = Bun.spawn([CLI_BIN, "login", "--with-api-key"], {
+      stdin: "pipe",
+      stdout: "ignore",
+      stderr: "pipe",
+      env: { ...(process.env as Record<string, string>), CODEX_HOME: home },
+      timeout: 30_000,
+    });
+    proc.stdin.write(apiKey);
+    await proc.stdin.end();
+    const exitCode = await proc.exited;
+    if (exitCode === 0) {
+      this.loggedInKey = apiKey;
+    } else {
+      const stderr = await new Response(proc.stderr).text();
+      throw new Error(
+        `Codex CLI login failed (exit ${exitCode}): ${stderr.trim()}`,
+      );
+    }
+  }
+
+  /**
+   * Build args for the modern Codex CLI (`codex exec ...`). Earlier versions
+   * accepted `codex --quiet <prompt>`; current releases (0.40+) reject bare
+   * `--quiet` and require the `exec` subcommand for non-interactive runs.
+   * `--skip-git-repo-check` lets it run in any working directory and
+   * `--color never` keeps the captured stdout free of ANSI control codes.
+   */
   private buildCliArgs(config: AISessionConfig, prompt: string): string[] {
     const args: string[] = [
-      "--quiet",
+      "exec",
+      "--skip-git-repo-check",
+      "--color",
+      "never",
       ...permissionFlags(config.permissionMode),
     ];
     if (config.model) args.push("--model", config.model);
     args.push(prompt);
     return args;
+  }
+
+  /** Spawn env with the resolved OPENAI_API_KEY + scoped CODEX_HOME. */
+  private async spawnEnv(home: string): Promise<Record<string, string>> {
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      CODEX_HOME: home,
+    };
+    const apiKey = (await this.resolveApiKey())?.trim();
+    if (apiKey) env["OPENAI_API_KEY"] = apiKey;
+    return env;
   }
 
   async sendPrompt(
@@ -586,11 +689,14 @@ class CodexCliAdapter implements ProviderAdapter {
   }> {
     const startTime = Date.now();
     const args = this.buildCliArgs(config, prompt);
+    const home = this.codexHome();
+    await this.ensureAuth(home);
 
     const proc = Bun.spawn([CLI_BIN, ...args], {
       stdout: "pipe",
       stderr: "pipe",
       cwd: config.workingDirectory || process.cwd(),
+      env: await this.spawnEnv(home),
       timeout: (config.providerConfig?.["timeoutMs"] as number) || 300_000,
     });
 
@@ -687,6 +793,7 @@ class CodexProvider implements AIAgentProvider {
   private logger: BoundLogger | null = null;
   private activeMode: ProviderMode | null = null;
   private adapter: ProviderAdapter | null = null;
+  private cachedApiKey: string | undefined;
 
   setHostServices(hs: HostServices): void {
     this.hostServices = hs;
@@ -694,6 +801,43 @@ class CodexProvider implements AIAgentProvider {
     const registry = new ProviderRegistry(hs);
     this.logIngester =
       registry.getProvider<LogIngester>("ai", "log-ingester") ?? null;
+
+    // Warm the cache so detectMode()/getCliLaunchSpec() (sync) see a key the
+    // user stored in the agent config bag, not just env vars.
+    void Promise.resolve(hs.getConfig?.("OPENAI_API_KEY"))
+      .then((apiKey) => {
+        const trimmed = apiKey?.trim();
+        if (trimmed) this.cachedApiKey = trimmed;
+      })
+      .catch(() => {});
+  }
+
+  /**
+   * Resolve OPENAI_API_KEY from env (operator override wins), the warmed
+   * cache, then the agent config bag the frontend writes to. Mirrors the
+   * resolution the other providers use so SDK + CLI mode work with a key
+   * saved purely through the UI.
+   */
+  private async resolveApiKey(): Promise<string | undefined> {
+    const envKey = process.env["OPENAI_API_KEY"]?.trim();
+    if (envKey) return envKey;
+
+    if (this.cachedApiKey) return this.cachedApiKey;
+
+    if (this.hostServices?.getConfig) {
+      try {
+        const apiKey = (
+          await this.hostServices.getConfig("OPENAI_API_KEY")
+        )?.trim();
+        if (apiKey) {
+          this.cachedApiKey = apiKey;
+          return apiKey;
+        }
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
   }
 
   getSupportedModes(): ProviderMode[] {
@@ -725,7 +869,8 @@ class CodexProvider implements AIAgentProvider {
   }
 
   private detectMode(): ProviderMode {
-    if (process.env["OPENAI_API_KEY"]) return "sdk";
+    if (process.env["OPENAI_API_KEY"]?.trim() || this.cachedApiKey)
+      return "sdk";
 
     try {
       // Cross-platform binary discovery via Bun.which (handles PATHEXT on Windows).
@@ -743,7 +888,9 @@ class CodexProvider implements AIAgentProvider {
 
     const mode = this.getMode();
     this.adapter =
-      mode === "sdk" ? new CodexSdkAdapter() : new CodexCliAdapter();
+      mode === "sdk"
+        ? new CodexSdkAdapter(() => this.resolveApiKey())
+        : new CodexCliAdapter(() => this.resolveApiKey());
     this.activeMode = mode;
     this.log("info", `Adapter initialized in ${mode} mode`);
     return this.adapter;
@@ -1029,7 +1176,7 @@ class CodexProvider implements AIAgentProvider {
     env?: Record<string, string>;
   } | null {
     const env: Record<string, string> = {};
-    const apiKey = process.env["OPENAI_API_KEY"]?.trim();
+    const apiKey = process.env["OPENAI_API_KEY"]?.trim() || this.cachedApiKey;
     if (apiKey) env["OPENAI_API_KEY"] = apiKey;
     return { binary: CLI_COMMAND, env };
   }
@@ -1040,7 +1187,7 @@ class CodexProvider implements AIAgentProvider {
     maxTokens?: number;
     extras?: Record<string, unknown>;
   }): Promise<{ text: string; usage?: unknown }> {
-    const adapter = new CodexSdkAdapter();
+    const adapter = new CodexSdkAdapter(() => this.resolveApiKey());
     const config: AISessionConfig = {
       name: "vibe-ai-sdk",
       agentType: PROVIDER_NAME,
@@ -1171,6 +1318,45 @@ function getCliVersion(): string | null {
   return null;
 }
 
+/**
+ * Install a global npm CLI, runtime-resiliently. The agent always ships Bun
+ * (it IS a Bun process) but NOT npm/node — the production agent image is Alpine
+ * + Bun only — so a hard-coded `npm install -g` silently fails there. We try
+ * each available global installer in turn and report the last error.
+ */
+function installGlobalNpmCli(pkgSpec: string): {
+  ok: boolean;
+  message: string;
+} {
+  const candidates: string[][] = [
+    ["bun", "install", "-g", pkgSpec],
+    ["npm", "install", "-g", pkgSpec],
+  ];
+  let lastError = "";
+  for (const cmd of candidates) {
+    const exe = cmd[0]!;
+    if (!Bun.which(exe, { PATH: process.env.PATH })) continue;
+    try {
+      const proc = Bun.spawnSync(cmd, {
+        timeout: 180_000,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (proc.exitCode === 0) return { ok: true, message: cmd.join(" ") };
+      lastError =
+        proc.stderr.toString().trim() || `${exe} exited ${proc.exitCode}`;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+  }
+  return {
+    ok: false,
+    message:
+      lastError ||
+      `No global installer (bun/npm) found. Run manually: bun install -g ${pkgSpec}`,
+  };
+}
+
 function createPrereqsRoutes() {
   return new Elysia({ prefix: "/prereqs" })
     .get("/status", () => {
@@ -1199,12 +1385,8 @@ function createPrereqsRoutes() {
         };
       }
 
-      const proc = Bun.spawnSync(CLI_INSTALL_COMMAND, {
-        timeout: 120_000,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      if (proc.exitCode === 0) {
+      const result = installGlobalNpmCli(CLI_NPM_PACKAGE);
+      if (result.ok) {
         return {
           ok: true,
           installed: [CLI_COMMAND],
@@ -1216,14 +1398,7 @@ function createPrereqsRoutes() {
         ok: false,
         installed: [],
         pendingSudo: [],
-        errors: [
-          {
-            name: CLI_COMMAND,
-            message:
-              proc.stderr.toString().trim() ||
-              `Run manually: ${CLI_INSTALL_COMMAND.join(" ")}`,
-          },
-        ],
+        errors: [{ name: CLI_COMMAND, message: result.message }],
       };
     });
 }
