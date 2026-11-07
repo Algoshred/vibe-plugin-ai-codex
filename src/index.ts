@@ -341,9 +341,14 @@ const CODEX_MODELS: AIModelInfo[] = [
 /** OpenAI SDK type aliases to avoid importing at module level */
 interface OpenAIClient {
   responses: {
+    /**
+     * Resolves to an OpenAIResponse, or to an async-iterable event stream
+     * when `stream: true` is passed. The SDK's promise itself is not
+     * iterable, so callers must await it before iterating.
+     */
     create(
       params: Record<string, unknown>,
-    ): Promise<OpenAIResponse> & AsyncIterable<OpenAIStreamEvent>;
+    ): Promise<OpenAIResponse | AsyncIterable<OpenAIStreamEvent>>;
   };
 }
 
@@ -482,9 +487,9 @@ class CodexSdkAdapter implements ProviderAdapter {
       params["max_output_tokens"] = config.maxTokens;
     }
 
-    const stream = client.responses.create(
+    const stream = (await client.responses.create(
       params,
-    ) as AsyncIterable<OpenAIStreamEvent>;
+    )) as AsyncIterable<OpenAIStreamEvent>;
 
     const collectedText: string[] = [];
     let finalModel = model;
