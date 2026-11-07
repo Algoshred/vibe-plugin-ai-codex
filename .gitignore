@@ -5,3 +5,7 @@ dist
 
 .build-sha
 **/.build-sha
+coverage/
+junit.xml
+sanity.log
+.eslintcache
