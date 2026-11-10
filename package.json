@@ -33,7 +33,7 @@
     "openai": "^7.47.0"
   },
   "devDependencies": {
-    "@burdenoff/toolchain": "2026.1107.3",
+    "@burdenoff/toolchain": "2026.1107.14",
     "@types/bun": "^1.4.4",
     "eslint": "^9.39.5",
     "knip": "^6.44.1",

@@ -1,6 +1,6 @@
 # >>> boff managed (do not edit)
 [install]
-minimumReleaseAge = "3d"
+minimumReleaseAge = 259200 # 3 days in seconds: Bun 1.3 (Dependabot) and 1.4 both accept a number
 minimumReleaseAgeExcludes = [
   "@burdenoff/adaptercloud-cli",
   "@burdenoff/adaptercloud-mcp",
